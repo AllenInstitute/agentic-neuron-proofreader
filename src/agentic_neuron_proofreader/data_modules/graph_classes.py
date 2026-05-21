@@ -10,27 +10,6 @@ morphologies.
 
 """
 
-from scipy.spatial import KDTree
-from scipy.spatial.distance import euclidean
-
-import networkx as nx
-import numpy as np
-
-from agentic_neuron_tracing.utils import graph_util
-
-
-"""
-Created on Wed July 2 14:00:00 2025
-
-@author: Anna Grim
-@email: anna.grim@alleninstitute.org
-
-Implementation of a custom subclass of Networkx.Graph called "SkeletonGraph".
-The graph is constructed by reading and processing SWC files (i.e. neuron
-fragments). It then stores the relevant information into the graph structure.
-
-"""
-
 from collections import defaultdict
 from concurrent.futures import as_completed, ThreadPoolExecutor
 from io import StringIO
@@ -43,7 +22,7 @@ import numpy as np
 import os
 import zipfile as zf
 
-from neuron_proofreader.utils import geometry_util, graph_util, img_util, util
+from agentic_neuron_proofreader.utils import graph_util, img_util, util
 
 
 class SkeletonGraph(nx.Graph):
@@ -69,7 +48,6 @@ class SkeletonGraph(nx.Graph):
         min_cable_length=0,
         node_spacing=1,
         prune_depth=20,
-        use_anisotropy=True,
         verbose=False,
     ):
         """
@@ -87,10 +65,6 @@ class SkeletonGraph(nx.Graph):
         prune_depth : float, optional
             Branches with length less than "prune_depth" microns are removed.
             Default is 20μm.
-        use_anisotropy : bool, optional
-            Indication of whether to apply anisotropy to SWC files. Note: set
-            to False if the SWC files are saved in physical coordinates.
-            Default is False.
         verbose : bool, optional
             Indication of whether to display a progress bar while building
             graph. Default is True.
@@ -107,7 +81,6 @@ class SkeletonGraph(nx.Graph):
         self.soma_component_ids = list()
 
         # Graph Loader
-        anisotropy = anisotropy if use_anisotropy else (1.0, 1.0, 1.0)
         self.graph_loader = graph_util.GraphLoader(
             anisotropy=anisotropy,
             min_cable_length=min_cable_length,

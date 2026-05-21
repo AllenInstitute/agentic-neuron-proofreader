@@ -36,7 +36,7 @@ import boto3
 import numpy as np
 import os
 
-from segmentation_skeleton_metrics.utils import util
+from agentic_neuron_proofreader.utils import util
 
 
 class Reader:
