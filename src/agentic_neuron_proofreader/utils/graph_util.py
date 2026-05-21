@@ -36,7 +36,7 @@ class GraphLoader:
         min_cable_length=40.0,
         node_spacing=1,
         prefetch=128,
-        prune_depth=24.0,
+        prune_depth=20.0,
         verbose=False,
     ):
         """
@@ -57,7 +57,7 @@ class GraphLoader:
             Number of jobs to prefetch. Default is 128.
         prune_depth : int, optional
             Branches with length less than "prune_depth" microns are pruned.
-            Default is 24.
+            Default is 20.0.
         verbose : bool, optional
             Indication of whether to display a progress bar while building
             FragmentsGraph. Default is True.
@@ -131,14 +131,13 @@ class GraphLoader:
             subgraph.
         """
         # Build graph
-        graph = swc_util.to_graph(swc_dict, set_attrs=True)
+        graph = swc_util.to_graph(swc_dict)
         prune_short_branches(graph, self.prune_depth)
 
         # Extract irreducible components (if applicable)
         if self.satisfies_cable_length_condition(graph):
             irreducibles = self.get_irreducibles(graph)
             if irreducibles:
-                irreducibles["is_soma"] = len(swc_dict["soma_nodes"]) > 0
                 irreducibles["swc_id"] = swc_dict["swc_name"]
             return irreducibles
         else:

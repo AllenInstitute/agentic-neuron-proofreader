@@ -18,6 +18,7 @@ from zipfile import ZipFile
 import boto3
 import os
 import pandas as pd
+import psutil
 import shutil
 
 
@@ -405,6 +406,18 @@ def read_txt_from_s3(path):
 
 
 # --- Miscellaneous ---
+def get_memory_usage():
+    """
+    Gets the current memory usage in gigabytes.
+
+    Returns
+    -------
+    float
+        Current memory usage in gigabytes.
+    """
+    return psutil.virtual_memory().used / 1e9
+
+
 def sample_once(my_container):
     """
     Samples a single element from "my_container".

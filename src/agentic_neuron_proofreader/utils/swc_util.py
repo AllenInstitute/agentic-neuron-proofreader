@@ -33,6 +33,7 @@ from tqdm import tqdm
 from zipfile import ZipFile
 
 import boto3
+import networkx as nx
 import numpy as np
 import os
 
@@ -45,19 +46,19 @@ class Reader:
     archive, and (3) local directory of ZIP archives.
     """
 
-    def __init__(self, swc_names=set(), verbose=True):
+    def __init__(self, anisotropy=(1.0, 1.0, 1.0), verbose=True):
         """
         Initializes a Reader object that reads SWC files.
 
         Parameters
         ----------
-        swc_names : Set[str], optional
-            Only SWC files with names in this set are loaded if provided.
-            Otherwise, all SWC files are loaded. Default is an empty set.
+        anisotropy : Tuple[float], optional
+            Image to physical coordinates scaling factors to account for the
+            anisotropy of the microscope. Default is (1.0, 1.0, 1.0).
         verbose : bool, optional
             Indication of whether to display a progress bar. Default is True.
         """
-        self.swc_names = swc_names
+        self.anisotropy = anisotropy
         self.verbose = verbose
 
     # --- Read Data ---
@@ -139,10 +140,7 @@ class Reader:
         """
         content = util.read_txt(path).splitlines()
         filename = os.path.basename(path)
-        if self.confirm_read(filename):
-            return self.parse(content, filename)
-        else:
-            return None
+        return self.parse(content, filename)
 
     def read_swcs(self, swc_paths, read_fn):
         """
@@ -165,8 +163,7 @@ class Reader:
             # Assign threads
             threads = set()
             for path in swc_paths:
-                if self.confirm_read(os.path.basename(path)):
-                    threads.add(executor.submit(read_fn, path))
+                threads.add(executor.submit(read_fn, path))
 
             # Store results
             swc_dicts = deque()
@@ -233,10 +230,7 @@ class Reader:
             threads = set()
             zf = ZipFile(zip_path, "r")
             for name in [f for f in zf.namelist() if f.endswith(".swc")]:
-                if self.confirm_read(name):
-                    threads.add(
-                        executor.submit(self.read_zipped_swc, zf, name)
-                    )
+                threads.add(executor.submit(self.read_zipped_swc, zf, name))
 
             # Store results
             swc_dicts = deque()
@@ -287,7 +281,7 @@ class Reader:
         assert util.is_s3_path(path) or util.is_gcs_path(path)
         use_s3 = util.is_s3_path(path)
 
-        # List filenames
+        # List paths
         swc_paths = util.list_cloud_paths(path, ".swc")
         zip_paths = util.list_cloud_paths(path, ".zip")
 
@@ -354,10 +348,9 @@ class Reader:
                 # Assign threads
                 threads = set()
                 for name in zf.namelist():
-                    if self.confirm_read(name):
-                        threads.add(
-                            executor.submit(self.read_zipped_swc, zf, name)
-                        )
+                    threads.add(
+                        executor.submit(self.read_zipped_swc, zf, name)
+                    )
 
                 # Process results
                 for thread in as_completed(threads):
@@ -393,10 +386,9 @@ class Reader:
                 # Assign threads
                 threads = set()
                 for name in zf.namelist():
-                    if self.confirm_read(name):
-                        threads.add(
-                            executor.submit(self.read_zipped_swc, zf, name)
-                        )
+                    threads.add(
+                        executor.submit(self.read_zipped_swc, zf, name)
+                    )
 
                 # Store results
                 swc_dicts = deque()
@@ -405,24 +397,6 @@ class Reader:
                     if result:
                         swc_dicts.append(result)
         return swc_dicts
-
-    def confirm_read(self, path):
-        """
-        Checks if the given filename should be loaded if the attribute
-        "swc_names" is non-empty.
-
-        Parameters
-        ----------
-        path : str
-            Path of SWC file to be checked.
-
-        Returns
-        -------
-        bool
-            Indication of whether to read SWC file.
-        """
-        name = os.path.splitext(os.path.basename(path))[0]
-        return name in self.swc_names if self.swc_names else True
 
     # -- Process Text ---
     def iterator(self, iterator):
@@ -479,7 +453,8 @@ class Reader:
             swc_dict = {
                 "id": np.zeros((len(content)), dtype=int),
                 "pid": np.zeros((len(content)), dtype=int),
-                "voxel": np.zeros((len(content), 3), dtype=np.int32),
+                "radius": np.zeros((len(content)), dtype=float),
+                "xyz": np.zeros((len(content), 3), dtype=np.int32),
                 "swc_name": swc_name,
             }
 
@@ -488,7 +463,12 @@ class Reader:
                 parts = line.split()
                 swc_dict["id"][i] = parts[0]
                 swc_dict["pid"][i] = parts[-1]
-                swc_dict["voxel"][i] = self.read_coordinate(parts[2:5], offset)
+                swc_dict["radius"][i] = float(parts[-2])
+                swc_dict["xyz"][i] = self.read_coordinate(parts[2:5], offset)
+
+            # Convert radius from nanometers to microns
+            if swc_dict["radius"][0] > 100:
+                swc_dict["radius"] /= 1000
             return swc_dict
         else:
             return None
@@ -535,4 +515,36 @@ class Reader:
         Tuple[int]
             xyz coordinates of an entry from an SWC file.
         """
-        return [float(xyz_str[i]) + offset[i] for i in range(3)]
+        iterator = zip(self.anisotropy, xyz_str, offset)
+        return [a * (float(s) + o) for a, s, o in iterator]
+
+
+def to_graph(swc_dict):
+    """
+    Converts an SWC dictionary to a NetworkX graph with reindexed nodes.
+
+    Parameters
+    ----------
+    swc_dict : dict
+        Contents of an SWC file.
+
+    Returns
+    -------
+    graph : networkx.Graph
+        Graph built from an SWC file.
+    """
+    # Reindex nodes: map swc ids to 0...N-1
+    id_map = {old_id: new_id for new_id, old_id in enumerate(swc_dict["id"])}
+    edges = [
+        (id_map[child], id_map[parent])
+        for child, parent in zip(swc_dict["id"][1:], swc_dict["pid"][1:])
+    ]
+
+    # Build graph with reindexed edges
+    graph = nx.Graph(
+        swc_name=swc_dict["swc_name"],
+        radius=swc_dict["radius"],
+        xyz=swc_dict["xyz"]
+    )
+    graph.add_edges_from(edges)
+    return graph

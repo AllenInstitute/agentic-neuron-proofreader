@@ -27,19 +27,7 @@ from agentic_neuron_proofreader.utils import graph_util, img_util, util
 
 class SkeletonGraph(nx.Graph):
     """
-    A custom subclass of NetworkX tailored for graphs constructed from SWC
-    files, where each connected component represents a single SWC file. The
-    graph is organized hierarchically into two levels of representation:
-
-        1. Irreducible structure — reduced graph where edges represent paths
-           between leaf and branching nodes in the original morphology.
-
-        2. Dense structure — the full, fine-grained graph reconstructed from
-           the SWC files, preserving detailed spatial geometry.
-
-    Attributes
-    ----------
-    ...
+    A custom subclass of NetworkX for graphs constructed from SWC files.
     """
 
     def __init__(
@@ -47,8 +35,7 @@ class SkeletonGraph(nx.Graph):
         anisotropy=(1.0, 1.0, 1.0),
         min_cable_length=0,
         node_spacing=1,
-        prune_depth=20,
-        verbose=False,
+        verbose=True,
     ):
         """
         Instantiates a SkeletonGraph object.
@@ -62,9 +49,6 @@ class SkeletonGraph(nx.Graph):
             Minimum path length of fragments loaded into graph. Default is 0.
         node_spacing : float, optional
             Distance (in microns) between neighboring nodes. Default 1μm.
-        prune_depth : float, optional
-            Branches with length less than "prune_depth" microns are removed.
-            Default is 20μm.
         verbose : bool, optional
             Indication of whether to display a progress bar while building
             graph. Default is True.
@@ -85,7 +69,6 @@ class SkeletonGraph(nx.Graph):
             anisotropy=anisotropy,
             min_cable_length=min_cable_length,
             node_spacing=node_spacing,
-            prune_depth=prune_depth,
             verbose=verbose,
         )
 
