@@ -10,10 +10,9 @@ General helper routines.
 
 from botocore import UNSIGNED
 from botocore.client import Config
-from collections import deque
 from random import sample
 from google.cloud import storage
-from io import BytesIO, StringIO
+from io import BytesIO
 from zipfile import ZipFile
 
 import boto3
@@ -143,7 +142,7 @@ def read_json(path):
     dict
         Contents of JSON file.
     """
-    return pd.read_json(path, storage_options={"anon": True}, typ="series")
+    return pd.read_json(path, typ="series")
 
 
 def read_txt(path):
@@ -300,9 +299,7 @@ def list_gcs_subdirectories(bucket_name, prefix):
     """
     # Load blobs
     storage_client = storage.Client()
-    blobs = storage_client.list_blobs(
-        bucket_name, prefix=prefix, delimiter="/"
-    )
+    blobs = storage_client.list_blobs(bucket_name, prefix=prefix, delimiter="/")
     [blob.name for blob in blobs]
 
     # Parse directory contents

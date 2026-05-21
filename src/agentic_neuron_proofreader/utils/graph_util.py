@@ -21,7 +21,7 @@ from tqdm import tqdm
 import networkx as nx
 import numpy as np
 
-from neuron_proofreader.utils import geometry_util as geometry, swc_util, util
+from agentic_neuron_proofreader.utils import geometry_util as geometry, swc_util
 
 
 class GraphLoader:
@@ -67,7 +67,7 @@ class GraphLoader:
         self.node_spacing = node_spacing
         self.prefetch = prefetch
         self.prune_depth = prune_depth
-        self.swc_reader = swc_util.Reader(anisotropy, min_cable_length, verbose)
+        self.swc_reader = swc_util.Reader(anisotropy, verbose)
         self.verbose = verbose
 
     def __call__(self, swc_pointer):
@@ -111,9 +111,7 @@ class GraphLoader:
 
                     # Continue submitting processes
                     if swc_dicts:
-                        pending.add(
-                            executor.submit(self.load, swc_dicts.pop())
-                        )
+                        pending.add(executor.submit(self.load, swc_dicts.pop()))
         return irreducibles
 
     def load(self, swc_dict):

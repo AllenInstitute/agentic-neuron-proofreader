@@ -4,11 +4,10 @@ Created on Thu May 21 12:00:00 2026
 @author: Anna Grim
 @email: anna.grim@alleninstitute.org
 
-Code for visualizing Skeletons.
+Code for visualizing skeletons.
 
 """
 
-import networkx as nx
 import plotly.graph_objects as go
 
 
