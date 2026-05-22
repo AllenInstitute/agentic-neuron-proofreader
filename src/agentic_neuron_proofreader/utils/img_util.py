@@ -9,6 +9,8 @@ Code for reading and processing images.
 """
 
 import json
+import matplotlib.pyplot as plt
+import numpy as np
 import tensorstore as ts
 
 from agentic_neuron_proofreader.utils import util
@@ -29,14 +31,14 @@ class TensorStoreImage:
             Path to image.
         """
         # Load image
-        bucket_name, path = util.parse_cloud_path(img_path)
+        bucket_name, inner_path = util.parse_cloud_path(img_path)
         self.img = ts.open(
             {
                 "driver": get_driver(img_path),
                 "kvstore": {
                     "driver": get_storage_driver(img_path),
                     "bucket": bucket_name,
-                    "path": path,
+                    "path": inner_path,
                 },
                 "context": {
                     "cache_pool": {"total_bytes_limit": 1000000000},
@@ -176,3 +178,73 @@ def is_precomputed(img_path):
         return False
     except Exception:
         return False
+
+
+def plot_mips(img, vmax=None):
+    """
+    Plots the Maximum Intensity Projections (MIPs) of a 3D image along the XY,
+    XZ, and YZ axes.
+
+    Parameters
+    ----------
+    img : numpy.ndarray
+        Image to generate MIPs from.
+    vmax : None or float
+        Brightness used as upper limit of the colormap. Default is None.
+    """
+    vmax = vmax or np.percentile(img, 99.9)
+    fig, axs = plt.subplots(1, 3, figsize=(10, 4))
+    axs_names = ["XY", "XZ", "YZ"]
+    for i in range(3):
+        mip = np.max(img, axis=i)
+        axs[i].imshow(mip, vmax=vmax)
+        axs[i].set_title(axs_names[i], fontsize=16)
+        axs[i].set_xticks([])
+        axs[i].set_yticks([])
+    plt.tight_layout()
+    plt.show()
+
+
+def to_physical(voxel, anisotropy, offset=(0, 0, 0)):
+    """
+    Converts a voxel coordinate to a physical coordinate by applying the
+    anisotropy scaling factors.
+
+    Parameters
+    ----------
+    voxel : ArrayLike
+        Voxel coordinate to be converted.
+    anisotropy : ArrayLike
+        Image to physical coordinates scaling factors to account for the
+        anisotropy of the microscope.
+    offset : Tuple[int], optional
+        Shift to be applied to "voxel". Default is (0, 0, 0).
+
+    Returns
+    -------
+    Tuple[float]
+        Physical coordinate.
+    """
+    voxel = voxel[::-1]
+    return tuple([voxel[i] * anisotropy[i] - offset[i] for i in range(3)])
+
+
+def to_voxels(xyz, anisotropy):
+    """
+    Converts coordinate from a physical to voxel space.
+
+    Parameters
+    ----------
+    xyz : ArrayLike
+        Physical coordinate to be converted.
+    anisotropy : ArrayLike
+        Image to physical coordinates scaling factors to account for the
+        anisotropy of the microscope.
+
+    Returns
+    -------
+    Tuple[int]
+        Voxel coordinate.
+    """
+    voxel = [int(xyz[i] / anisotropy[i]) for i in range(3)]
+    return tuple(voxel[::-1])

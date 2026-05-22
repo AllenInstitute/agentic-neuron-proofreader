@@ -21,7 +21,10 @@ from tqdm import tqdm
 import networkx as nx
 import numpy as np
 
-from agentic_neuron_proofreader.utils import geometry_util as geometry, swc_util
+from agentic_neuron_proofreader.utils import (
+    geometry_util as geometry,
+    swc_util,
+)
 
 
 class GraphLoader:
@@ -111,7 +114,9 @@ class GraphLoader:
 
                     # Continue submitting processes
                     if swc_dicts:
-                        pending.add(executor.submit(self.load, swc_dicts.pop()))
+                        pending.add(
+                            executor.submit(self.load, swc_dicts.pop())
+                        )
         return irreducibles
 
     def load(self, swc_dict):
