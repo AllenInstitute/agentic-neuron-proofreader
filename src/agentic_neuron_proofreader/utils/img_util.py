@@ -253,6 +253,103 @@ def plot_segmentation_mips(segmentation):
     plt.show()
 
 
+def plot_skeleton_mips(node_groups, patch_shape, separate_rows=False):
+    """
+    Plots skeleton-node MIPs along the XY, XZ, and YZ axes for the same patch
+    used by `plot_mips` / `plot_segmentation_mips`. Each group can include
+    edges, which are drawn as line segments connecting their endpoints.
+
+    Parameters
+    ----------
+    node_groups : Dict[str, dict]
+        Mapping from group label (e.g., "GT", "UNet") to a dict with:
+            - "nodes" : numpy.ndarray of shape (N, 3) -- local (z, y, x)
+              voxel coords. Use `SkeletonGraph.nodes_in_patch(...)`.
+            - "color" : str, matplotlib color used for nodes (and edges,
+              when `components` is not supplied).
+            - "edges" : numpy.ndarray of shape (E, 2, 3), optional. Each
+              entry is [start_xyz, end_xyz] in local (z, y, x) voxels.
+              Use `SkeletonGraph.edges_in_patch(...)`.
+            - "components" : numpy.ndarray of shape (E,), optional. Per-edge
+              connected-component IDs. When supplied, edges are colored by
+              component using a categorical colormap (tab20) instead of the
+              group's `color`. Use `edges_in_patch(..., return_components=True)`.
+        Legacy form `(coords, color)` tuples are also accepted.
+    patch_shape : Tuple[int]
+        Shape of the patch in (z, y, x) order. Used to fix axis limits so the
+        skeleton MIP panels align with image / segmentation MIPs of the same
+        volume.
+    separate_rows : bool, optional
+        If True, render each group on its own row of the figure (no overlay).
+        Otherwise all groups are drawn on the same 1x3 panel. Default False.
+    """
+    # Normalize legacy tuple form -> dict
+    groups = {}
+    for label, value in node_groups.items():
+        if isinstance(value, dict):
+            groups[label] = value
+        else:
+            coords, color = value
+            groups[label] = {"nodes": coords, "color": color}
+
+    axs_names = ["XY", "XZ", "YZ"]
+    # For axis=i MIP in (z, y, x) array, the 2D plane uses the OTHER two axes.
+    plane_axes = [(1, 2), (0, 2), (0, 1)]
+
+    n_rows = len(groups) if separate_rows else 1
+    fig, axs = plt.subplots(n_rows, 3, figsize=(10, 4 * n_rows), squeeze=False)
+
+    if separate_rows:
+        rows = [(r, label, group) for r, (label, group) in enumerate(groups.items())]
+    else:
+        rows = [(0, label, group) for label, group in groups.items()]
+
+    comp_cmap = plt.get_cmap("tab20")
+
+    for r, label, group in rows:
+        coords = group.get("nodes", np.empty((0, 3)))
+        color = group["color"]
+        edges = group.get("edges", np.empty((0, 2, 3)))
+        components = group.get("components")
+        # Map each unique component ID -> a slot in tab20 (per-group).
+        edge_colors = None
+        if components is not None and len(components):
+            unique_comps = np.unique(components)
+            comp_to_idx = {c: i for i, c in enumerate(unique_comps)}
+            edge_colors = np.array(
+                [comp_cmap(comp_to_idx[c] % comp_cmap.N) for c in components]
+            )
+        for i, (name, (a, b)) in enumerate(zip(axs_names, plane_axes)):
+            ax = axs[r, i]
+            ax.set_facecolor("black")
+            if len(edges):
+                if edge_colors is not None:
+                    # Per-edge color: draw as a LineCollection so we can pass
+                    # an array of colors instead of one per ax.plot() call.
+                    from matplotlib.collections import LineCollection
+                    segs = np.stack([edges[:, 0, [b, a]], edges[:, 1, [b, a]]], axis=1)
+                    lc = LineCollection(segs, colors=edge_colors, linewidths=2.0, alpha=0.95)
+                    ax.add_collection(lc)
+                else:
+                    xs = edges[:, :, b].T  # shape (2, E)
+                    ys = edges[:, :, a].T
+                    ax.plot(xs, ys, color=color, linewidth=2.0, alpha=0.95)
+            if len(coords):
+                ax.scatter(coords[:, b], coords[:, a], s=8, c=color, label=label)
+            ax.set_xlim(0, patch_shape[b])
+            ax.set_ylim(patch_shape[a], 0)
+            ax.set_aspect("equal")
+            title = f"{label} -- {name}" if separate_rows else name
+            ax.set_title(title, fontsize=14)
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+    if not separate_rows and any(len(g.get("nodes", [])) for g in groups.values()):
+        axs[0, 0].legend(loc="upper right", markerscale=3, fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
+
 def to_physical(voxel, anisotropy, offset=(0, 0, 0)):
     """
     Converts a voxel coordinate to a physical coordinate by applying the
