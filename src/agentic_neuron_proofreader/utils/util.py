@@ -432,4 +432,4 @@ def sample_once(my_container):
     hashable
         Random element from the given container.
     """
-    return sample(my_container, 1)[0]
+    return sample(list(my_container), 1)[0]

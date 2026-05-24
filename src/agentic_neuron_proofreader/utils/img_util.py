@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorstore as ts
 
+from matplotlib.colors import ListedColormap
+
 from agentic_neuron_proofreader.utils import util
 
 
@@ -198,6 +200,52 @@ def plot_mips(img, vmax=None):
     for i in range(3):
         mip = np.max(img, axis=i)
         axs[i].imshow(mip, vmax=vmax)
+        axs[i].set_title(axs_names[i], fontsize=16)
+        axs[i].set_xticks([])
+        axs[i].set_yticks([])
+    plt.tight_layout()
+    plt.show()
+
+
+def make_segmentation_colormap(mask, seed=42):
+    """
+    Creates a matplotlib ListedColormap for a segmentation. Ensures label 0
+    maps to black and all other labels get distinct random colors.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        Segmentation mask with integer labels. Assumes label 0 is background.
+    seed : int, optional
+        Random seed for color reproducibility. Default is 42.
+
+    Returns
+    -------
+    ListedColormap
+        Colormap with black for background and unique colors for other labels.
+    """
+    n_labels = int(mask.max()) + 1
+    rng = np.random.default_rng(seed)
+    colors = [(0, 0, 0)]
+    colors += list(rng.uniform(0.2, 1.0, size=(n_labels - 1, 3)))
+    return ListedColormap(colors)
+
+
+def plot_segmentation_mips(segmentation):
+    """
+    Plots maximum intensity projections (MIPs) of a segmentation.
+
+    Parameters
+    ----------
+    segmentation : numpy.ndarray
+        Segmentation to generate MIPs from.
+    """
+    fig, axs = plt.subplots(1, 3, figsize=(10, 4))
+    axs_names = ["XY", "XZ", "YZ"]
+    cmap = make_segmentation_colormap(segmentation)
+    for i in range(3):
+        mip = np.max(segmentation, axis=i)
+        axs[i].imshow(mip, cmap=cmap, interpolation="none")
         axs[i].set_title(axs_names[i], fontsize=16)
         axs[i].set_xticks([])
         axs[i].set_yticks([])
