@@ -10,7 +10,6 @@ Code for visualizing skeletons.
 
 import plotly.graph_objects as go
 
-
 def visualize(graph):
     """
     Visualizes the given graph using Plotly.
