@@ -6,7 +6,6 @@ built-in configuration values, see the documentation:
 """
 
 from datetime import date
-from mypackage import __version__ as package_version
 from os.path import abspath, dirname
 from pathlib import Path
 
@@ -17,6 +16,8 @@ import sys
 project_root = Path(__file__).resolve().parents[2]
 src_path = project_root / "src"
 sys.path.insert(0, str(src_path))
+
+from agentic_neuron_proofreader import __version__ as package_version
 
 
 INSTITUTE_NAME = "Allen Institute for Neural Dynamics"
