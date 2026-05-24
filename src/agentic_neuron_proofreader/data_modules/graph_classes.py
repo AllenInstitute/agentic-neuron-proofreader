@@ -675,6 +675,86 @@ class SkeletonGraph(nx.Graph):
         """
         return img_util.to_voxels(self.node_xyz[i], self.anisotropy)
 
+    def nodes_in_patch(self, offset, patch_shape, return_ids=False):
+        """
+        Finds all nodes whose voxel coordinate falls inside a 3D patch.
+
+        Parameters
+        ----------
+        offset : Tuple[int]
+            Patch origin in global voxel space, in (z, y, x) order.
+        patch_shape : Tuple[int]
+            Patch size in voxels, in (z, y, x) order.
+        return_ids : bool, optional
+            If True, also return the global node IDs alongside the local
+            voxel coordinates. Default is False.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of shape (N, 3) with each node's local voxel coordinate
+            (i.e., relative to the patch origin) in (z, y, x) order.
+        numpy.ndarray, optional
+            Array of shape (N,) with the corresponding global node IDs.
+            Only returned when `return_ids=True`.
+        """
+        lo = np.array(offset)
+        hi = lo + np.array(patch_shape)
+        # node_xyz is (x, y, z) microns; voxel order is (z, y, x) -> reverse
+        vox = (self.node_xyz / self.anisotropy)[:, ::-1]
+        inside = np.all((vox >= lo) & (vox < hi), axis=1)
+        local = vox[inside] - lo
+        if return_ids:
+            ids = np.where(inside)[0]
+            return local, ids
+        return local
+
+    def edges_in_patch(self, offset, patch_shape, return_components=False):
+        """
+        Returns edges whose endpoints both fall inside the patch, in local
+        voxel coordinates.
+
+        Parameters
+        ----------
+        offset : Tuple[int]
+            Patch origin in global voxel space, in (z, y, x) order.
+        patch_shape : Tuple[int]
+            Patch size in voxels, in (z, y, x) order.
+        return_components : bool, optional
+            If True, also return the connected-component ID of each edge.
+            Both endpoints of an edge always share the same component, so the
+            ID is taken from the start endpoint. Default False.
+
+        Returns
+        -------
+        numpy.ndarray
+            Array of shape (E, 2, 3): for each edge, [start_xyz, end_xyz] in
+            local (z, y, x) voxel coords relative to the patch origin.
+        numpy.ndarray, optional
+            Array of shape (E,) with the connected-component ID per edge.
+            Only returned when `return_components=True`.
+        """
+        lo = np.array(offset)
+        hi = lo + np.array(patch_shape)
+        vox = (self.node_xyz / self.anisotropy)[:, ::-1]
+        inside = np.all((vox >= lo) & (vox < hi), axis=1)
+        edges = []
+        components = []
+        for u, v in self.edges():
+            if inside[u] and inside[v]:
+                edges.append((vox[u] - lo, vox[v] - lo))
+                if return_components:
+                    components.append(self.node_component_id[u])
+        edges_arr = np.array(edges) if edges else np.empty((0, 2, 3))
+        if return_components:
+            comp_arr = (
+                np.array(components, dtype=int)
+                if components
+                else np.empty((0,), dtype=int)
+            )
+            return edges_arr, comp_arr
+        return edges_arr
+
     def nodes_with_component_id(self, component_id):
         """
         Gets all nodes with the given componenet ID.
