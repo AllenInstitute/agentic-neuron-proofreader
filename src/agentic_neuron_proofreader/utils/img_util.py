@@ -265,15 +265,19 @@ def plot_skeleton_mips(node_groups, patch_shape, separate_rows=False):
         Mapping from group label (e.g., "GT", "UNet") to a dict with:
             - "nodes" : numpy.ndarray of shape (N, 3) -- local (z, y, x)
               voxel coords. Use `SkeletonGraph.nodes_in_patch(...)`.
-            - "color" : str, matplotlib color used for nodes (and edges,
-              when `components` is not supplied).
+            - "color" : str, matplotlib color used for nodes/edges when no
+              component IDs are supplied.
             - "edges" : numpy.ndarray of shape (E, 2, 3), optional. Each
               entry is [start_xyz, end_xyz] in local (z, y, x) voxels.
               Use `SkeletonGraph.edges_in_patch(...)`.
             - "components" : numpy.ndarray of shape (E,), optional. Per-edge
-              connected-component IDs. When supplied, edges are colored by
-              component using a categorical colormap (tab20) instead of the
-              group's `color`. Use `edges_in_patch(..., return_components=True)`.
+              connected-component IDs. When supplied, edges are colored
+              per-component using a high-contrast palette (60 distinct
+              shuffled colors). Use `edges_in_patch(..., return_components=True)`.
+            - "node_components" : numpy.ndarray of shape (N,), optional.
+              Per-node component IDs. When supplied, nodes are colored
+              per-component using the same palette as edges. Use
+              `nodes_in_patch(..., return_components=True)`.
         Legacy form `(coords, color)` tuples are also accepted.
     patch_shape : Tuple[int]
         Shape of the patch in (z, y, x) order. Used to fix axis limits so the
@@ -304,20 +308,50 @@ def plot_skeleton_mips(node_groups, patch_shape, separate_rows=False):
     else:
         rows = [(0, label, group) for label, group in groups.items()]
 
-    comp_cmap = plt.get_cmap("tab20")
+    import colorsys
+
+    def make_palette(k):
+        # Maximally-separated colors via even spacing in HSV hue. Guarantees
+        # that 2 components are 180° apart, 3 components are 120° apart, etc.
+        # Saturation/value are kept high for visibility on the black bg.
+        if k <= 0:
+            return np.empty((0, 4))
+        hues = (np.arange(k) / max(k, 1) + 0.05) % 1.0
+        rgb = np.array([colorsys.hsv_to_rgb(h, 0.9, 1.0) for h in hues])
+        rgba = np.concatenate([rgb, np.ones((k, 1))], axis=1)
+        return rgba
 
     for r, label, group in rows:
         coords = group.get("nodes", np.empty((0, 3)))
         color = group["color"]
         edges = group.get("edges", np.empty((0, 2, 3)))
-        components = group.get("components")
-        # Map each unique component ID -> a slot in tab20 (per-group).
+        edge_components = group.get("components")
+        node_components = group.get("node_components")
+        # Build a single comp_id -> palette slot map shared by edges + nodes
+        # within this group so an edge and its endpoint get the same color.
+        # Palette is sized to the number of unique components in this group,
+        # so 2 components are red/cyan, 3 are red/green/blue, etc.
+        comp_to_idx = None
+        comp_palette = None
+        if edge_components is not None or node_components is not None:
+            ids = []
+            if edge_components is not None and len(edge_components):
+                ids.append(np.asarray(edge_components))
+            if node_components is not None and len(node_components):
+                ids.append(np.asarray(node_components))
+            if ids:
+                unique_comps = np.unique(np.concatenate(ids))
+                comp_to_idx = {c: i for i, c in enumerate(unique_comps)}
+                comp_palette = make_palette(len(unique_comps))
         edge_colors = None
-        if components is not None and len(components):
-            unique_comps = np.unique(components)
-            comp_to_idx = {c: i for i, c in enumerate(unique_comps)}
+        if edge_components is not None and len(edge_components) and comp_palette is not None:
             edge_colors = np.array(
-                [comp_cmap(comp_to_idx[c] % comp_cmap.N) for c in components]
+                [comp_palette[comp_to_idx[c]] for c in edge_components]
+            )
+        node_colors = None
+        if node_components is not None and len(node_components) and comp_palette is not None:
+            node_colors = np.array(
+                [comp_palette[comp_to_idx[c]] for c in node_components]
             )
         for i, (name, (a, b)) in enumerate(zip(axs_names, plane_axes)):
             ax = axs[r, i]
@@ -335,7 +369,8 @@ def plot_skeleton_mips(node_groups, patch_shape, separate_rows=False):
                     ys = edges[:, :, a].T
                     ax.plot(xs, ys, color=color, linewidth=2.0, alpha=0.95)
             if len(coords):
-                ax.scatter(coords[:, b], coords[:, a], s=8, c=color, label=label)
+                node_c = node_colors if node_colors is not None else color
+                ax.scatter(coords[:, b], coords[:, a], s=8, c=node_c, label=label)
             ax.set_xlim(0, patch_shape[b])
             ax.set_ylim(patch_shape[a], 0)
             ax.set_aspect("equal")
@@ -346,6 +381,115 @@ def plot_skeleton_mips(node_groups, patch_shape, separate_rows=False):
 
     if not separate_rows and any(len(g.get("nodes", [])) for g in groups.values()):
         axs[0, 0].legend(loc="upper right", markerscale=3, fontsize=9)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_skeleton_errors(
+    correct_edges,
+    error_groups,
+    patch_shape,
+    seg_patch=None,
+    seg_cmap=None,
+):
+    """
+    Visualizes skeleton errors with clear spatial context.
+
+    Correct edges are drawn dimmed as gray context lines. Each error type
+    is rendered with a thick colored edge and a semi-transparent halo so
+    errors pop out immediately. An optional segmentation MIP background
+    provides spatial context for why errors occur (e.g., segment boundaries
+    for splits, unlabeled regions for omits).
+
+    Parameters
+    ----------
+    correct_edges : numpy.ndarray
+        Shape (E, 2, 3) array of correct edges in local (z, y, x) voxels.
+    error_groups : Dict[str, dict]
+        Mapping from error label to dict with:
+            - "edges" : ndarray (E, 2, 3)
+            - "nodes" : ndarray (N, 3)
+            - "color" : str, matplotlib color name
+    patch_shape : Tuple[int]
+        (z, y, x) shape of the patch volume.
+    seg_patch : numpy.ndarray, optional
+        Segmentation volume (integer labels, 0 = background). When provided,
+        a color-coded MIP is drawn as semi-transparent background.
+    seg_cmap : ListedColormap, optional
+        Colormap for seg_patch. If None and seg_patch is given, one is
+        generated automatically.
+    """
+    from matplotlib.collections import LineCollection
+
+    axs_names = ["XY", "XZ", "YZ"]
+    plane_axes = [(1, 2), (0, 2), (0, 1)]
+
+    fig, axs = plt.subplots(1, 3, figsize=(12, 4.5))
+
+    for i, (name, (a, b)) in enumerate(zip(axs_names, plane_axes)):
+        ax = axs[i]
+        ax.set_facecolor("black")
+
+        # Background: segmentation MIP (semi-transparent)
+        if seg_patch is not None:
+            cmap = seg_cmap or make_segmentation_colormap(seg_patch)
+            seg_mip = np.max(seg_patch, axis=i)
+            ax.imshow(seg_mip, cmap=cmap, interpolation="none", alpha=0.35)
+
+        # Correct edges: thin, low-alpha gray
+        if len(correct_edges):
+            segs = np.stack(
+                [correct_edges[:, 0, [b, a]], correct_edges[:, 1, [b, a]]], axis=1
+            )
+            lc = LineCollection(segs, colors=(0.4, 0.4, 0.4, 0.3), linewidths=1.0)
+            ax.add_collection(lc)
+
+        # Error edges: halo + solid line + nodes
+        for label, group in error_groups.items():
+            edges = group.get("edges", np.empty((0, 2, 3)))
+            nodes = group.get("nodes", np.empty((0, 3)))
+            color = group["color"]
+
+            if len(edges):
+                segs = np.stack(
+                    [edges[:, 0, [b, a]], edges[:, 1, [b, a]]], axis=1
+                )
+                # Halo (thick, semi-transparent)
+                lc_halo = LineCollection(
+                    segs, colors=color, linewidths=6.0, alpha=0.25
+                )
+                ax.add_collection(lc_halo)
+                # Solid line
+                lc_solid = LineCollection(
+                    segs, colors=color, linewidths=2.5, alpha=1.0
+                )
+                ax.add_collection(lc_solid)
+
+            if len(nodes):
+                ax.scatter(
+                    nodes[:, b], nodes[:, a],
+                    s=30, c=color, edgecolors="white",
+                    linewidths=0.5, alpha=0.9, zorder=5,
+                )
+
+        ax.set_xlim(0, patch_shape[b])
+        ax.set_ylim(patch_shape[a], 0)
+        ax.set_aspect("equal")
+        ax.set_title(name, fontsize=14)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    # Legend
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([0], [0], color="gray", linewidth=1, alpha=0.5, label="Correct")
+    ]
+    for label, group in error_groups.items():
+        handles.append(
+            Line2D([0], [0], color=group["color"], linewidth=3, label=label)
+        )
+    axs[0].legend(handles=handles, loc="upper right", fontsize=8, framealpha=0.6)
+
     plt.tight_layout()
     plt.show()
 

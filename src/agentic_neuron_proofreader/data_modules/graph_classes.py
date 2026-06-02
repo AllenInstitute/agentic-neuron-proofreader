@@ -675,7 +675,9 @@ class SkeletonGraph(nx.Graph):
         """
         return img_util.to_voxels(self.node_xyz[i], self.anisotropy)
 
-    def nodes_in_patch(self, offset, patch_shape, return_ids=False):
+    def nodes_in_patch(
+        self, offset, patch_shape, return_ids=False, return_components=False
+    ):
         """
         Finds all nodes whose voxel coordinate falls inside a 3D patch.
 
@@ -686,8 +688,10 @@ class SkeletonGraph(nx.Graph):
         patch_shape : Tuple[int]
             Patch size in voxels, in (z, y, x) order.
         return_ids : bool, optional
-            If True, also return the global node IDs alongside the local
-            voxel coordinates. Default is False.
+            If True, also return the global node IDs. Default is False.
+        return_components : bool, optional
+            If True, also return the connected-component ID per node.
+            Default is False.
 
         Returns
         -------
@@ -697,6 +701,9 @@ class SkeletonGraph(nx.Graph):
         numpy.ndarray, optional
             Array of shape (N,) with the corresponding global node IDs.
             Only returned when `return_ids=True`.
+        numpy.ndarray, optional
+            Array of shape (N,) with the connected-component ID per node.
+            Only returned when `return_components=True`.
         """
         lo = np.array(offset)
         hi = lo + np.array(patch_shape)
@@ -704,10 +711,12 @@ class SkeletonGraph(nx.Graph):
         vox = (self.node_xyz / self.anisotropy)[:, ::-1]
         inside = np.all((vox >= lo) & (vox < hi), axis=1)
         local = vox[inside] - lo
+        out = [local]
         if return_ids:
-            ids = np.where(inside)[0]
-            return local, ids
-        return local
+            out.append(np.where(inside)[0])
+        if return_components:
+            out.append(self.node_component_id[inside])
+        return tuple(out) if len(out) > 1 else out[0]
 
     def edges_in_patch(self, offset, patch_shape, return_components=False):
         """
