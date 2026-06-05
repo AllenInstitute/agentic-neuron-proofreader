@@ -101,7 +101,7 @@ class Reader:
             # Local SWC files
             paths = util.read_paths(swc_pointer, extension=".swc")
             if len(paths) > 0:
-                return self.read_swcs(paths, self.read_swc)
+                return self.read_swcs(paths)
 
             raise Exception("Directory is Invalid!")
 
@@ -142,7 +142,7 @@ class Reader:
         filename = os.path.basename(path)
         return self.parse(content, filename)
 
-    def read_swcs(self, swc_paths, read_fn):
+    def read_swcs(self, swc_paths):
         """
         Reads SWC files stored in a GCS or S3 bucket.
 
@@ -161,7 +161,9 @@ class Reader:
         """
         with ThreadPoolExecutor() as executor:
             # Assign threads
-            threads = {executor.submit(read_fn, path) for path in swc_paths}
+            threads = {
+                executor.submit(self.read_swc, path) for path in swc_paths
+            }
             pbar = self.manual_progress_bar(len(threads))
 
             # Store results
