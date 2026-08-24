@@ -9,10 +9,11 @@ Code for reading and processing images.
 """
 
 import json
+import time
+
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorstore as ts
-
 from matplotlib.colors import ListedColormap
 
 from agentic_neuron_proofreader.utils import util
@@ -148,7 +149,7 @@ def get_storage_driver(img_path):
         raise ValueError(f"Unsupported path type: {img_path}")
 
 
-def is_precomputed(img_path):
+def is_precomputed(img_path, max_attempts=4, initial_backoff_seconds=0.5):
     """
     Checks if the path points to a Neuroglancer precomputed dataset.
 
@@ -156,30 +157,55 @@ def is_precomputed(img_path):
     ----------
     img_path : str
         Path to be checked (can be local, GCS, or S3).
+    max_attempts : int
+        Maximum metadata-read attempts. Retries are used only for exceptions;
+        missing or invalid metadata returns False immediately. Default is 4.
+    initial_backoff_seconds : float
+        Delay before the first retry. Later retries use exponential backoff.
+        Default is 0.5 seconds.
 
     Returns
     -------
     bool
         True if the path appears to be a Neuroglancer precomputed dataset.
     """
+    max_attempts = int(max_attempts)
+    initial_backoff_seconds = float(initial_backoff_seconds)
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    if initial_backoff_seconds < 0:
+        raise ValueError("initial_backoff_seconds must be non-negative")
+
+    # Build the spec once. TensorStore's GCS credential provider can briefly be
+    # unavailable while a fresh process initializes; retry only those exceptional
+    # reads rather than misclassifying a valid dataset as an invalid path.
     try:
-        # Build kvstore spec
         bucket_name, path = util.parse_cloud_path(img_path)
-        kv = {"driver": "gcs", "bucket": bucket_name, "path": path}
-
-        # Open the info file
-        store = ts.KvStore.open(kv).result()
-        raw = store.read(b"info").result()
-
-        # Only proceed if the key exists and has content
-        if raw.state != "missing" and raw.value:
-            info = json.loads(raw.value.decode("utf8"))
-            is_valid_type = info.get("type") in ("image", "segmentation")
-            if isinstance(info, dict) and is_valid_type and "scales" in info:
-                return True
+    except (AttributeError, TypeError):
         return False
-    except Exception:
-        return False
+    kv = {"driver": "gcs", "bucket": bucket_name, "path": path}
+    for attempt in range(max_attempts):
+        try:
+            store = ts.KvStore.open(kv).result()
+            raw = store.read(b"info").result()
+
+            # Missing or structurally invalid metadata is a deterministic negative,
+            # not a transient transport/authentication failure.
+            if raw.state == "missing" or not raw.value:
+                return False
+            try:
+                info = json.loads(raw.value.decode("utf8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return False
+            return bool(
+                isinstance(info, dict)
+                and info.get("type") in ("image", "segmentation")
+                and "scales" in info
+            )
+        except Exception:  # noqa: BLE001 - TensorStore exposes several error types.
+            if attempt + 1 == max_attempts:
+                return False
+            time.sleep(initial_backoff_seconds * (2 ** attempt))
 
 
 def plot_mips(img, vmax=None):
