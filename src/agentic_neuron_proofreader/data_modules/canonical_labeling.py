@@ -407,6 +407,250 @@ def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
     return merge_label_set, sites
 
 
+def audit_junction_gt_connections(
+    fragments_graph, gt_graph, node_label, junction_nodes, *,
+    branch_length_um=60.0, exclude_center_um=10.0, sample_step_um=2.0,
+    match_radius_um=6.0, ambiguity_margin_um=2.0,
+    min_support_um=20.0, min_support_fraction=0.8,
+    min_gt_nodes=MERGE_MIN_NODES,
+):
+    """Audit local connections without changing canonical labels or merge sites.
+
+    Each arm is followed only to its next junction, leaf, or length limit.
+    Samples outside a central exclusion zone must continuously match substantial
+    same-segment GT on distinct neurons. Nearby competing neurons make a sample
+    ambiguous, even when they carry a different segment label. A positive result
+    is review evidence, not an automatically validated site or training target;
+    all other results are unknown, never certified non-merges.
+    """
+    from scipy.spatial import cKDTree
+
+    parameters = {
+        "branch_length_um": float(branch_length_um),
+        "exclude_center_um": float(exclude_center_um),
+        "sample_step_um": float(sample_step_um),
+        "match_radius_um": float(match_radius_um),
+        "ambiguity_margin_um": float(ambiguity_margin_um),
+        "min_support_um": float(min_support_um),
+        "min_support_fraction": float(min_support_fraction),
+        "min_gt_nodes": int(min_gt_nodes),
+    }
+    lengths = [branch_length_um, sample_step_um, match_radius_um, min_support_um]
+    if (not all(np.isfinite(value) and value > 0 for value in lengths)
+            or not np.isfinite(exclude_center_um) or exclude_center_um < 0
+            or not np.isfinite(ambiguity_margin_um) or ambiguity_margin_um < 0
+            or not 0 < min_support_fraction <= 1
+            or min_gt_nodes < 0 or int(min_gt_nodes) != min_gt_nodes
+            or branch_length_um <= exclude_center_um):
+        raise ValueError("Invalid junction audit parameters")
+    labels = np.asarray(node_label)
+    gt_xyz = np.asarray(gt_graph.node_xyz)
+    if labels.shape != (len(gt_xyz),):
+        raise ValueError("node_label must align with gt_graph.node_xyz")
+    gt_components = np.asarray(gt_graph.node_component_id)
+    neuron_names = {
+        int(component): str(gt_graph.component_id_to_swc_id[int(component)])
+        for component in np.unique(gt_components)
+    }
+    counts = defaultdict(int)
+    for gt_node in gt_graph.nodes:
+        if labels[gt_node] != UNLABELED:
+            counts[(int(labels[gt_node]), neuron_names[int(gt_components[gt_node])])] += 1
+    finite_nodes = np.flatnonzero(np.all(np.isfinite(gt_xyz), axis=1))
+    tree = cKDTree(gt_xyz[finite_nodes])
+    fragment_xyz = np.asarray(fragments_graph.node_xyz)
+    records = []
+    for junction in dict.fromkeys(int(node) for node in junction_nodes):
+        if junction not in fragments_graph or fragments_graph.degree(junction) < 3:
+            raise ValueError(f"Node {junction} is not a junction")
+        segment = int(fragments_graph.node_segment_id(junction))
+        branches = []
+        branch_nodes = []
+        for neighbor in sorted(fragments_graph.neighbors(junction)):
+            previous, current = junction, int(neighbor)
+            visited = {junction}
+            points = [fragment_xyz[junction]]
+            distances = [0.0]
+            while current not in visited:
+                visited.add(current)
+                if int(fragments_graph.node_segment_id(current)) != segment:
+                    break
+                point = fragment_xyz[current]
+                length = float(np.linalg.norm(point - points[-1]))
+                if not np.isfinite(length):
+                    raise ValueError("Non-finite fragment geometry")
+                if length > 0:
+                    points.append(point)
+                    distances.append(distances[-1] + length)
+                if distances[-1] >= branch_length_um or fragments_graph.degree(current) != 2:
+                    break
+                onward = [int(node) for node in fragments_graph.neighbors(current) if node != previous]
+                previous, current = current, onward[0]
+            branch_nodes.append(visited - {junction})
+            extent = min(distances[-1], branch_length_um)
+            count = max(0, int(np.floor((extent - exclude_center_um) / sample_step_um)))
+            positions = exclude_center_um + (np.arange(count) + 0.5) * sample_step_um
+            points = np.asarray(points)
+            samples = np.column_stack([
+                np.interp(positions, distances, points[:, dimension]) for dimension in range(3)
+            ])
+            matches = []
+            for point, nearby in zip(samples, tree.query_ball_point(
+                    samples, r=match_radius_um + ambiguity_margin_um)):
+                nearest_by_neuron = {}
+                for index in nearby:
+                    gt_node = int(finite_nodes[index])
+                    name = neuron_names[int(gt_components[gt_node])]
+                    distance = float(np.linalg.norm(gt_xyz[gt_node] - point))
+                    if name not in nearest_by_neuron or distance < nearest_by_neuron[name][0]:
+                        nearest_by_neuron[name] = (distance, gt_node)
+                ordered = sorted(nearest_by_neuron.items(), key=lambda item: item[1][0])
+                match = None
+                if ordered:
+                    name, (distance, gt_node) = ordered[0]
+                    separated = (len(ordered) == 1
+                                 or ordered[1][1][0] - distance > ambiguity_margin_um)
+                    if (distance <= match_radius_um and separated
+                            and labels[gt_node] == segment
+                            and counts[(segment, name)] > min_gt_nodes):
+                        match = name
+                matches.append(match)
+            support = {}
+            for name in sorted({name for name in matches if name is not None}):
+                longest, consecutive = 0, 0
+                for match in matches:
+                    consecutive = consecutive + 1 if match == name else 0
+                    longest = max(longest, consecutive)
+                support[name] = {
+                    "continuous_um": float(longest * sample_step_um),
+                    "fraction": float(matches.count(name) / count),
+                }
+            accepted = [name for name, evidence in support.items()
+                        if evidence["continuous_um"] >= min_support_um
+                        and evidence["fraction"] >= min_support_fraction]
+            branches.append({
+                "neighbor_node_id": int(neighbor), "extent_um": float(extent),
+                "n_samples": count, "support": support,
+                "gt_neuron": accepted[0] if len(accepted) == 1 else None,
+            })
+        reconverging = any(branch_nodes[first] & branch_nodes[second]
+                          for first in range(len(branch_nodes))
+                          for second in range(first + 1, len(branch_nodes)))
+        supported = sorted({branch["gt_neuron"] for branch in branches
+                            if branch["gt_neuron"] is not None})
+        supported_merge = len(supported) >= 2 and not reconverging
+        records.append({
+            "node_id": junction, "segment_id": segment,
+            "xyz": [float(value) for value in fragment_xyz[junction]],
+            "status": "merge_supported" if supported_merge else "unknown",
+            "reason": ("distinct_gt_neurons_on_separate_arms" if supported_merge else
+                       "reconverging_arms" if reconverging else "insufficient_distinct_gt_support"),
+            "gt_neurons": supported, "branches": branches,
+        })
+    return {
+        "schema_version": 1, "method": "junction_gt_branch_support_v1",
+        "audit_only": True, "parameters": parameters, "junctions": records,
+    }
+
+
+def junction_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
+    """Locate two-GT connections before candidate NMS or model scoring.
+
+    All junctions on segments satisfying the original two-neuron node-count
+    rule are audited. Supported sites are consolidated within 30 um of cable,
+    only for the same segment and GT-neuron set. Existing geometric sites are
+    not removed. The representative is an actual supported junction node.
+    """
+    import heapq
+
+    eligible_segments = merge_labels(gt_graph, node_label)
+    component_segments = {
+        int(component): int(str(name).split(".")[0])
+        for component, name in fragments_graph.component_id_to_swc_id.items()
+    }
+    node_components = np.asarray(fragments_graph.node_component_id)
+    junctions = [int(node) for node, degree in fragments_graph.degree()
+                 if degree >= 3 and component_segments[int(node_components[node])] in eligible_segments]
+    if verbose:
+        print(f"Junction merge localization: auditing {len(junctions)} raw junctions "
+              f"on {len(eligible_segments)} two-GT segments", flush=True)
+    audit = audit_junction_gt_connections(fragments_graph, gt_graph, node_label, junctions)
+    supported = {record["node_id"]: record for record in audit["junctions"]
+                 if record["status"] == "merge_supported"}
+    xyz = np.asarray(fragments_graph.node_xyz)
+    suppressed, sites = set(), []
+    for node in sorted(supported):
+        if node in suppressed:
+            continue
+        record = supported[node]
+        sites.append({
+            "segment_id": record["segment_id"], "gt_neuron": record["gt_neurons"][0],
+            "gt_neurons": record["gt_neurons"], "xyz": tuple(record["xyz"]),
+            "node_id": node, "source": "two_gt_junction",
+            "branch_support": record["branches"],
+        })
+        best, queue = {node: 0.0}, [(0.0, node)]
+        while queue:
+            distance, current = heapq.heappop(queue)
+            if distance > best[current]:
+                continue
+            other = supported.get(current)
+            if (other is not None and other["segment_id"] == record["segment_id"]
+                    and other["gt_neurons"] == record["gt_neurons"]):
+                suppressed.add(current)
+            for neighbor in fragments_graph.neighbors(current):
+                neighbor = int(neighbor)
+                if component_segments[int(node_components[neighbor])] != record["segment_id"]:
+                    continue
+                step = distance + float(np.linalg.norm(xyz[neighbor] - xyz[current]))
+                if step <= MERGE_DEDUP_UM and step < best.get(neighbor, float("inf")):
+                    best[neighbor] = step
+                    heapq.heappush(queue, (step, neighbor))
+    metadata = {
+        "method": audit["method"], "parameters": audit["parameters"],
+        "dedup_cable_um": MERGE_DEDUP_UM, "n_raw_junctions_audited": len(junctions),
+        "n_supported_junctions": len(supported), "n_two_gt_sites": len(sites),
+    }
+    if verbose:
+        print(f"Junction merge localization: {len(supported)} supported junctions, "
+              f"{len(sites)} consolidated sites", flush=True)
+    return sites, metadata
+
+
+def combined_merge_sites(fragments_graph, gt_graph, node_label, geometric_sites, verbose=True):
+    """Union existing geometric sites with localized two-GT connections.
+
+    Repeated calls are idempotent: prior two_gt_junction records are rebuilt,
+    while all supplied geometric records are preserved. Coincident records on
+    the same segment are represented once with both evidence sources.
+    """
+    geometric = []
+    for site in geometric_sites:
+        if site.get("source") == "two_gt_junction":
+            continue
+        record = dict(site)
+        record["source"] = "geometric_walk"
+        for key in ("sources", "junction_evidence"):
+            record.pop(key, None)
+        geometric.append(record)
+    supplemental, metadata = junction_merge_sites(
+        fragments_graph, gt_graph, node_label, verbose=verbose)
+    by_position = {(int(site["segment_id"]), tuple(map(float, site["xyz"]))): site
+                   for site in geometric}
+    combined = list(geometric)
+    for site in supplemental:
+        key = (int(site["segment_id"]), tuple(map(float, site["xyz"])))
+        existing = by_position.get(key)
+        if existing is None:
+            combined.append(site)
+            by_position[key] = site
+        else:
+            existing["sources"] = ["geometric_walk", "two_gt_junction"]
+            existing["junction_evidence"] = site
+    return combined, {**metadata, "n_geometric_sites": len(geometric),
+                      "n_combined_sites": len(combined)}
+
+
 def _walk_to_merge_site(fragments_graph, gt_graph, node_label, gt_kdtree,
                         source, node_set, visited, seg_id, gt_comps, frag_xyz):
     """DFS inward from ``source`` until a node lands within ``MERGE_APPROACH_UM``
