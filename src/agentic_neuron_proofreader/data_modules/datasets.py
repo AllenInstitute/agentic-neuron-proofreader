@@ -83,6 +83,9 @@ class BrainDataset(Dataset):
         canonical ``labels_with_merge`` set, including grazing fusions the
         node-count rule alone misses. The walk uses ``fragments_graph`` +
         ``gt_graph.kdtree`` (both cache-resident, no extra cloud read).
+        The stored merge_sites list combines that walk with two-GT junction
+        localization. Site counts therefore need not match the original
+        geometric-only MergeCountMetric.
 
         Parameters
         ----------
@@ -92,7 +95,7 @@ class BrainDataset(Dataset):
             ``img_path`` (the raw fused image).
         geometric_merges : bool, optional
             Run the geometric merge walk over ``fragments_graph``. Default True.
-            Set False to skip it (faster; node-count merges only).
+            Set False to skip it. Two-GT junction localization still runs.
         verbose : bool, optional
             Show progress while reading. Default True.
 
@@ -116,26 +119,67 @@ class BrainDataset(Dataset):
         )
         canonical_labeling.fix_label_misalignments(self.gt_graph, node_label)
 
-        # Merge labels: node-count rule UNION geometric walk.
-        merge_set = canonical_labeling.merge_labels(self.gt_graph, node_label)
-        merge_sites = []
-        if geometric_merges and self.fragments_graph is not None:
-            self.gt_graph.set_kdtree()
-            geo_labels, merge_sites = canonical_labeling.geometric_merge_sites(
-                self.fragments_graph, self.gt_graph, node_label, verbose=verbose
-            )
-            merge_set = merge_set | geo_labels
-
-        edge_error = canonical_labeling.compute_edge_error(
-            self.gt_graph, node_label, merge_label_set=merge_set
-        )
-
         self.segmentation_path = seg_path
         self.gt_graph.node_label = node_label
-        self.gt_graph.edge_error = edge_error
-        self.gt_graph.merge_labels = np.array(sorted(merge_set), dtype=np.int64)
-        self.gt_graph.merge_sites = merge_sites
+        self.refresh_merge_labels(geometric_merges=geometric_merges, verbose=verbose)
         return node_label
+
+    def refresh_merge_labels(self, geometric_merges=True, reuse_geometric_sites=False, verbose=True):
+        """Rebuild merge truth from stored GT node labels, with no volume reads.
+
+        Both criteria feed one merge_labels set and one merge_sites list. When
+        reusing a labelled cache, preserve all old geometric sites and merge
+        labels; rebuild only the supplemental two-GT site localization.
+        """
+        if self.gt_graph is None or getattr(self.gt_graph, "node_label", None) is None:
+            raise ValueError("Canonical GT node labels are required")
+        node_label = self.gt_graph.node_label
+        merge_set = canonical_labeling.merge_labels(self.gt_graph, node_label)
+        sites = []
+        if reuse_geometric_sites:
+            if not geometric_merges:
+                raise ValueError("Cannot reuse geometric sites with geometric_merges=False")
+            stored_sites = getattr(self.gt_graph, "merge_sites", None)
+            stored_labels = getattr(self.gt_graph, "merge_labels", None)
+            if stored_sites is None or stored_labels is None:
+                raise ValueError("Stored geometric sites and merge labels are required")
+            sites = stored_sites
+            merge_set.update(int(label) for label in stored_labels)
+        elif geometric_merges and self.fragments_graph is not None:
+            self.gt_graph.set_kdtree()
+            geometric_labels, sites = canonical_labeling.geometric_merge_sites(
+                self.fragments_graph, self.gt_graph, node_label, verbose=verbose)
+            merge_set.update(geometric_labels)
+        metadata = None
+        if self.fragments_graph is not None:
+            sites, metadata = canonical_labeling.combined_merge_sites(
+                self.fragments_graph, self.gt_graph, node_label, sites, verbose=verbose)
+        merge_set.update(int(site["segment_id"]) for site in sites)
+        self.gt_graph.edge_error = canonical_labeling.compute_edge_error(
+            self.gt_graph, node_label, merge_label_set=merge_set)
+        self.gt_graph.merge_labels = np.array(sorted(merge_set), dtype=np.int64)
+        self.gt_graph.merge_sites = sites
+        self.gt_graph.merge_site_metadata = metadata
+        self.gt_graph.junction_gt_audit = None
+        return sites
+
+    def audit_junction_gt_connections(self, junction_nodes, **parameters):
+        """Attach opt-in, versioned review evidence without relabeling the cache.
+
+        Requires canonical GT node labels already in memory. No cloud reads,
+        training, or changes to merge_labels / merge_sites are performed.
+        Repeated calls replace the previous audit with the requested node set.
+        """
+        if self.fragments_graph is None or self.gt_graph is None:
+            raise ValueError("Both fragment and GT graphs are required")
+        labels = getattr(self.gt_graph, "node_label", None)
+        if labels is None:
+            raise ValueError("Canonical GT node labels are required")
+        audit = canonical_labeling.audit_junction_gt_connections(
+            self.fragments_graph, self.gt_graph, labels, junction_nodes, **parameters
+        )
+        self.gt_graph.junction_gt_audit = audit
+        return audit
 
     # --- Persistence ---
     def save(self, path):
@@ -168,9 +212,11 @@ class BrainDataset(Dataset):
             ),
             "gt_edge_error": getattr(self.gt_graph, "edge_error", None),
             # Merge segment ids (union of node-count rule + geometric walk) and
-            # the geometric merge sites, for reproducing % Merged Edges / merges.
+            # combined geometric-walk and two-GT junction sites.
             "gt_merge_labels": getattr(self.gt_graph, "merge_labels", None),
             "gt_merge_sites": getattr(self.gt_graph, "merge_sites", None),
+            "gt_merge_site_metadata": getattr(self.gt_graph, "merge_site_metadata", None),
+            "gt_junction_audit": getattr(self.gt_graph, "junction_gt_audit", None),
         }
         with open(path, "wb") as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -220,6 +266,12 @@ class BrainDataset(Dataset):
         merge_sites = payload.get("gt_merge_sites")
         if merge_sites is not None:
             instance.gt_graph.merge_sites = merge_sites
+        site_metadata = payload.get("gt_merge_site_metadata")
+        if site_metadata is not None:
+            instance.gt_graph.merge_site_metadata = site_metadata
+        junction_audit = payload.get("gt_junction_audit")
+        if junction_audit is not None:
+            instance.gt_graph.junction_gt_audit = junction_audit
         return instance
 
     def __getitem__(self):
