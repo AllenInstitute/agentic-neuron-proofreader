@@ -9,6 +9,7 @@ Custom dataset classes.
 """
 
 import pickle
+from datetime import datetime, timezone
 
 import numpy as np
 from torch.utils.data import Dataset
@@ -65,7 +66,8 @@ class BrainDataset(Dataset):
 
     # --- Canonical labeling ---
     def label_gt_from_segmentation(self, segmentation_path=None,
-                                   geometric_merges=True, verbose=True):
+                                   geometric_merges=True, verbose=True,
+                                   thresholds=None):
         """
         Reads the dense predicted segmentation at every GT node's voxel and
         attaches the canonical per-node label and per-edge error class to
@@ -98,6 +100,9 @@ class BrainDataset(Dataset):
             Set False to skip it. Two-GT junction localization still runs.
         verbose : bool, optional
             Show progress while reading. Default True.
+        thresholds : canonical_labeling.MergeThresholds, optional
+            GT node-count thresholds of the merge rules. Default: the module
+            constants (50 nodes). Recorded on ``gt_graph.label_policy``.
 
         Returns
         -------
@@ -121,20 +126,29 @@ class BrainDataset(Dataset):
 
         self.segmentation_path = seg_path
         self.gt_graph.node_label = node_label
-        self.refresh_merge_labels(geometric_merges=geometric_merges, verbose=verbose)
+        self.refresh_merge_labels(geometric_merges=geometric_merges, verbose=verbose,
+                                  thresholds=thresholds)
         return node_label
 
-    def refresh_merge_labels(self, geometric_merges=True, reuse_geometric_sites=False, verbose=True):
+    def refresh_merge_labels(self, geometric_merges=True, reuse_geometric_sites=False, verbose=True,
+                             thresholds=None):
         """Rebuild merge truth from stored GT node labels, with no volume reads.
 
         Both criteria feed one merge_labels set and one merge_sites list. When
         reusing a labelled cache, preserve all old geometric sites and merge
-        labels; rebuild only the supplemental two-GT site localization.
+        labels; rebuild only the supplemental two-GT site localization (the
+        stored walk sites then keep the thresholds they were computed with).
+
+        ``thresholds`` (``canonical_labeling.MergeThresholds``) sets the GT
+        node-count thresholds of every rule; None means the module constants.
+        The thresholds used are recorded on ``gt_graph.label_policy`` and in
+        ``gt_graph.merge_site_metadata``.
         """
         if self.gt_graph is None or getattr(self.gt_graph, "node_label", None) is None:
             raise ValueError("Canonical GT node labels are required")
+        thresholds = canonical_labeling.resolve_thresholds(thresholds)
         node_label = self.gt_graph.node_label
-        merge_set = canonical_labeling.merge_labels(self.gt_graph, node_label)
+        merge_set = canonical_labeling.merge_labels(self.gt_graph, node_label, thresholds=thresholds)
         sites = []
         if reuse_geometric_sites:
             if not geometric_merges:
@@ -148,18 +162,25 @@ class BrainDataset(Dataset):
         elif geometric_merges and self.fragments_graph is not None:
             self.gt_graph.set_kdtree()
             geometric_labels, sites = canonical_labeling.geometric_merge_sites(
-                self.fragments_graph, self.gt_graph, node_label, verbose=verbose)
+                self.fragments_graph, self.gt_graph, node_label, verbose=verbose,
+                thresholds=thresholds)
             merge_set.update(geometric_labels)
         metadata = None
         if self.fragments_graph is not None:
             sites, metadata = canonical_labeling.combined_merge_sites(
-                self.fragments_graph, self.gt_graph, node_label, sites, verbose=verbose)
+                self.fragments_graph, self.gt_graph, node_label, sites, verbose=verbose,
+                thresholds=thresholds)
         merge_set.update(int(site["segment_id"]) for site in sites)
         self.gt_graph.edge_error = canonical_labeling.compute_edge_error(
-            self.gt_graph, node_label, merge_label_set=merge_set)
+            self.gt_graph, node_label, merge_label_set=merge_set, thresholds=thresholds)
         self.gt_graph.merge_labels = np.array(sorted(merge_set), dtype=np.int64)
         self.gt_graph.merge_sites = sites
-        self.gt_graph.merge_site_metadata = metadata
+        self.gt_graph.merge_site_metadata = {**(metadata or {}), "thresholds": thresholds.as_record()}
+        self.gt_graph.label_policy = {
+            **thresholds.as_record(),
+            "reused_geometric_sites": bool(reuse_geometric_sites),
+            "written": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
         self.gt_graph.junction_gt_audit = None
         return sites
 
@@ -217,6 +238,9 @@ class BrainDataset(Dataset):
             "gt_merge_sites": getattr(self.gt_graph, "merge_sites", None),
             "gt_merge_site_metadata": getattr(self.gt_graph, "merge_site_metadata", None),
             "gt_junction_audit": getattr(self.gt_graph, "junction_gt_audit", None),
+            # Merge thresholds the labels were computed with (None for caches
+            # written before the policy was recorded: the 50-node rule).
+            "gt_label_policy": getattr(self.gt_graph, "label_policy", None),
         }
         with open(path, "wb") as f:
             pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -272,6 +296,9 @@ class BrainDataset(Dataset):
         junction_audit = payload.get("gt_junction_audit")
         if junction_audit is not None:
             instance.gt_graph.junction_gt_audit = junction_audit
+        label_policy = payload.get("gt_label_policy")
+        if label_policy is not None:
+            instance.gt_graph.label_policy = label_policy
         return instance
 
     def __getitem__(self):
