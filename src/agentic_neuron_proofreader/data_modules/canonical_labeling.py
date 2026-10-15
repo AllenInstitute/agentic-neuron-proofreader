@@ -29,6 +29,7 @@ gate for that, and ``swap_zyx_to_xyz`` / ``transpose`` below exist to adjust it
 without touching anything else.
 """
 
+import dataclasses
 from collections import defaultdict, deque
 
 import networkx as nx
@@ -63,6 +64,69 @@ MERGE_DIST_AWAY_UM = 50.0   # leaf must be this far from any GT node to start a 
 MERGE_APPROACH_UM = 6.0     # walk inward until within this distance of a GT node
 MERGE_PASSTHRU_MIN_CC = 50  # GT same-label component smaller than this = pass-through
 MERGE_DEDUP_UM = 30.0       # merge sites closer than this are duplicates
+
+
+@dataclasses.dataclass(frozen=True)
+class MergeThresholds:
+    """GT node-count thresholds of the merge rules, with the policy that set them.
+
+    ``min_nodes`` is the node-count merge rule (``merge_labels``), the ``# Merges``
+    count in ``summarize`` and the junction audit's ``min_gt_nodes``;
+    ``passthru_min_cc`` is the walk's pass-through test. The module constants are
+    the ``nodes`` policy: 50 GT nodes, which is about 50 um at the canonical
+    package's ~1 um node spacing. A cache's GT graph is resampled (about 4 um
+    between nodes), so the same count there means about 200 um and drops short
+    genuine merges; ``from_length`` expresses one cable length in the graph's own
+    node spacing instead, so every graph applies the same physical threshold.
+    """
+
+    min_nodes: int = MERGE_MIN_NODES
+    passthru_min_cc: int = MERGE_PASSTHRU_MIN_CC
+    policy: str = "nodes"
+    length_um: float | None = None
+    gt_median_edge_um: float | None = None
+
+    def __post_init__(self):
+        for name in ("min_nodes", "passthru_min_cc"):
+            value = getattr(self, name)
+            is_integer = isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+            if not is_integer or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer, got {value!r}")
+
+    @classmethod
+    def nodes(cls, count=MERGE_MIN_NODES):
+        """Every threshold set to the same GT node count (the original rule)."""
+        return cls(min_nodes=count, passthru_min_cc=count, policy="nodes")
+
+    @classmethod
+    def from_length(cls, gt_graph, length_um=50.0):
+        """Every threshold set to the node count spanning ``length_um`` of cable
+        in ``gt_graph`` (its median edge length), at least one node."""
+        spacing = median_edge_length(gt_graph)
+        count = max(1, round(float(length_um) / spacing))
+        return cls(min_nodes=count, passthru_min_cc=count, policy="length",
+                   length_um=float(length_um), gt_median_edge_um=spacing)
+
+    def as_record(self):
+        """Plain dict for cache metadata and manifests."""
+        return dataclasses.asdict(self)
+
+
+DEFAULT_THRESHOLDS = MergeThresholds()
+
+
+def resolve_thresholds(thresholds):
+    """``thresholds`` or the module defaults when None."""
+    return DEFAULT_THRESHOLDS if thresholds is None else thresholds
+
+
+def median_edge_length(graph):
+    """Median Euclidean edge length of a skeleton graph (microns)."""
+    edges = np.asarray(list(graph.edges))
+    if len(edges) == 0:
+        raise ValueError("graph has no edges")
+    xyz = np.asarray(graph.node_xyz, dtype=float)
+    return float(np.median(np.linalg.norm(xyz[edges[:, 0]] - xyz[edges[:, 1]], axis=1)))
 
 
 def label_gt_nodes(
@@ -262,11 +326,12 @@ def segment_to_gt_neurons(gt_graph, node_label):
     }
 
 
-def merge_labels(gt_graph, node_label, min_nodes=MERGE_MIN_NODES):
+def merge_labels(gt_graph, node_label, min_nodes=None, thresholds=None):
     """
     Set of segment ids that constitute a merge by the *node-count* rule: a
     segment landing on >= 2 distinct GT neurons with **more than ``min_nodes``
-    GT nodes on each**.
+    GT nodes on each**. ``min_nodes`` defaults to ``thresholds.min_nodes``
+    (module default 50, see ``MergeThresholds``).
 
     Mirrors ``MergedEdgePercentMetric.detect_label_intersections`` (the
     ``num_nodes1 > 50 and num_nodes2 > 50`` test). This catches fusions where the
@@ -274,6 +339,8 @@ def merge_labels(gt_graph, node_label, min_nodes=MERGE_MIN_NODES):
     bridge runs through empty space and only grazes the second neuron -- those are
     found instead by the geometric walk in ``geometric_merge_labels``.
     """
+    if min_nodes is None:
+        min_nodes = resolve_thresholds(thresholds).min_nodes
     labels = set()
     for lab, counts in segment_neuron_node_counts(gt_graph, node_label).items():
         substantial = [n for n, c in counts.items() if c > min_nodes]
@@ -337,17 +404,17 @@ def _gt_label_components(gt_graph, label, label_nodes):
     return list(nx.connected_components(gt_graph.subgraph(nodes)))
 
 
-def _is_nonmerge_passthru(gt_node, comps):
+def _is_nonmerge_passthru(gt_node, comps, min_cc=MERGE_PASSTHRU_MIN_CC):
     """True if ``gt_node`` sits in a GT same-label component smaller than
-    ``MERGE_PASSTHRU_MIN_CC`` -- a likely pass-through, not a merge. ``comps`` is
-    the same-label component list from ``_gt_label_components``."""
+    ``min_cc`` nodes -- a likely pass-through, not a merge. ``comps`` is the
+    same-label component list from ``_gt_label_components``."""
     for cc in comps:
         if gt_node in cc:
-            return len(cc) < MERGE_PASSTHRU_MIN_CC
+            return len(cc) < min_cc
     return True
 
 
-def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
+def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True, thresholds=None):
     """
     Walks fragment skeletons to locate merge sites, porting
     ``MergeCountMetric.search_for_merges`` / ``find_merge_site`` / ``verify_site``
@@ -356,8 +423,8 @@ def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
     For each fragment whose segment label appears on the GT, start at any leaf
     that is > ``MERGE_DIST_AWAY_UM`` from the GT, walk inward until within
     ``MERGE_APPROACH_UM`` of a GT node; if that node is not a tiny same-label
-    pass-through, record a merge site. Spatially-redundant sites within
-    ``MERGE_DEDUP_UM`` are collapsed.
+    pass-through (fewer than ``thresholds.passthru_min_cc`` GT nodes), record a
+    merge site. Spatially-redundant sites within ``MERGE_DEDUP_UM`` are collapsed.
 
     Returns
     -------
@@ -365,6 +432,7 @@ def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
         ``merge_label_set`` -- segment ids flagged as merges by the walk.
         ``sites`` -- list of dicts (segment_id, gt_neuron, xyz) for inspection.
     """
+    passthru_min_cc = resolve_thresholds(thresholds).passthru_min_cc
     gt_kdtree = gt_graph.kdtree
     label_nodes = _label_to_gt_nodes(gt_graph, node_label)
     labels_on_gt = set(label_nodes)
@@ -398,6 +466,7 @@ def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
             site = _walk_to_merge_site(
                 fragments_graph, gt_graph, node_label, gt_kdtree,
                 leaf, node_set, visited, seg_id, gt_comps, frag_xyz,
+                passthru_min_cc,
             )
             if site is not None:
                 raw_sites.append(site)
@@ -412,9 +481,10 @@ def audit_junction_gt_connections(
     branch_length_um=60.0, exclude_center_um=10.0, sample_step_um=2.0,
     match_radius_um=6.0, ambiguity_margin_um=2.0,
     min_support_um=20.0, min_support_fraction=0.8,
-    min_gt_nodes=MERGE_MIN_NODES,
+    min_gt_nodes=None, thresholds=None,
 ):
     """Audit local connections without changing canonical labels or merge sites.
+    ``min_gt_nodes`` defaults to ``thresholds.min_nodes``.
 
     Each arm is followed only to its next junction, leaf, or length limit.
     Samples outside a central exclusion zone must continuously match substantial
@@ -425,6 +495,8 @@ def audit_junction_gt_connections(
     """
     from scipy.spatial import cKDTree
 
+    if min_gt_nodes is None:
+        min_gt_nodes = resolve_thresholds(thresholds).min_nodes
     parameters = {
         "branch_length_um": float(branch_length_um),
         "exclude_center_um": float(exclude_center_um),
@@ -553,7 +625,7 @@ def audit_junction_gt_connections(
     }
 
 
-def junction_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
+def junction_merge_sites(fragments_graph, gt_graph, node_label, verbose=True, thresholds=None):
     """Locate two-GT connections before candidate NMS or model scoring.
 
     All junctions on segments satisfying the original two-neuron node-count
@@ -563,7 +635,8 @@ def junction_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
     """
     import heapq
 
-    eligible_segments = merge_labels(gt_graph, node_label)
+    thresholds = resolve_thresholds(thresholds)
+    eligible_segments = merge_labels(gt_graph, node_label, thresholds=thresholds)
     component_segments = {
         int(component): int(str(name).split(".")[0])
         for component, name in fragments_graph.component_id_to_swc_id.items()
@@ -574,7 +647,8 @@ def junction_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
     if verbose:
         print(f"Junction merge localization: auditing {len(junctions)} raw junctions "
               f"on {len(eligible_segments)} two-GT segments", flush=True)
-    audit = audit_junction_gt_connections(fragments_graph, gt_graph, node_label, junctions)
+    audit = audit_junction_gt_connections(fragments_graph, gt_graph, node_label, junctions,
+                                          thresholds=thresholds)
     supported = {record["node_id"]: record for record in audit["junctions"]
                  if record["status"] == "merge_supported"}
     xyz = np.asarray(fragments_graph.node_xyz)
@@ -610,6 +684,7 @@ def junction_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
         "method": audit["method"], "parameters": audit["parameters"],
         "dedup_cable_um": MERGE_DEDUP_UM, "n_raw_junctions_audited": len(junctions),
         "n_supported_junctions": len(supported), "n_two_gt_sites": len(sites),
+        "thresholds": thresholds.as_record(),
     }
     if verbose:
         print(f"Junction merge localization: {len(supported)} supported junctions, "
@@ -617,7 +692,8 @@ def junction_merge_sites(fragments_graph, gt_graph, node_label, verbose=True):
     return sites, metadata
 
 
-def combined_merge_sites(fragments_graph, gt_graph, node_label, geometric_sites, verbose=True):
+def combined_merge_sites(fragments_graph, gt_graph, node_label, geometric_sites, verbose=True,
+                         thresholds=None):
     """Union existing geometric sites with localized two-GT connections.
 
     Repeated calls are idempotent: prior two_gt_junction records are rebuilt,
@@ -634,7 +710,7 @@ def combined_merge_sites(fragments_graph, gt_graph, node_label, geometric_sites,
             record.pop(key, None)
         geometric.append(record)
     supplemental, metadata = junction_merge_sites(
-        fragments_graph, gt_graph, node_label, verbose=verbose)
+        fragments_graph, gt_graph, node_label, verbose=verbose, thresholds=thresholds)
     by_position = {(int(site["segment_id"]), tuple(map(float, site["xyz"]))): site
                    for site in geometric}
     combined = list(geometric)
@@ -652,7 +728,8 @@ def combined_merge_sites(fragments_graph, gt_graph, node_label, geometric_sites,
 
 
 def _walk_to_merge_site(fragments_graph, gt_graph, node_label, gt_kdtree,
-                        source, node_set, visited, seg_id, gt_comps, frag_xyz):
+                        source, node_set, visited, seg_id, gt_comps, frag_xyz,
+                        passthru_min_cc=MERGE_PASSTHRU_MIN_CC):
     """DFS inward from ``source`` until a node lands within ``MERGE_APPROACH_UM``
     of the GT; verify and return a site dict, or None."""
     queue = deque([source])
@@ -661,7 +738,7 @@ def _walk_to_merge_site(fragments_graph, gt_graph, node_label, gt_kdtree,
         i = queue.pop()
         dist_i, gt_node = gt_kdtree.query(frag_xyz[i])
         if dist_i < MERGE_APPROACH_UM:
-            if _is_nonmerge_passthru(int(gt_node), gt_comps):
+            if _is_nonmerge_passthru(int(gt_node), gt_comps, passthru_min_cc):
                 return None
             xyz = frag_xyz[i]
             return {
@@ -695,8 +772,8 @@ def _dedup_sites(raw_sites):
     return [s for k, s in enumerate(raw_sites) if k not in rm]
 
 
-def compute_edge_error(gt_graph, node_label, merge_min_nodes=MERGE_MIN_NODES,
-                       merge_label_set=None):
+def compute_edge_error(gt_graph, node_label, merge_min_nodes=None,
+                       merge_label_set=None, thresholds=None):
     """
     Derives a per-edge error class from the node labels alone (no extra reads).
 
@@ -719,6 +796,8 @@ def compute_edge_error(gt_graph, node_label, merge_min_nodes=MERGE_MIN_NODES,
     (plus the fragments graph for the geometric part) -- so a viewer can color the
     skeleton with zero logic.
     """
+    if merge_min_nodes is None:
+        merge_min_nodes = resolve_thresholds(thresholds).min_nodes
     merged = (merge_label_set if merge_label_set is not None
               else merge_labels(gt_graph, node_label, merge_min_nodes))
     err = np.empty(gt_graph.number_of_edges(), dtype=np.uint8)
@@ -735,7 +814,7 @@ def compute_edge_error(gt_graph, node_label, merge_min_nodes=MERGE_MIN_NODES,
     return err
 
 
-def summarize(gt_graph, node_label, edge_error=None, merge_label_set=None):
+def summarize(gt_graph, node_label, edge_error=None, merge_label_set=None, thresholds=None):
     """
     Computes the cache-only canonical summary: per-edge class fractions, total
     splits, and total merges. Useful for the verification step.
@@ -746,8 +825,9 @@ def summarize(gt_graph, node_label, edge_error=None, merge_label_set=None):
 
     Returns a dict of plain Python numbers.
     """
+    min_nodes = resolve_thresholds(thresholds).min_nodes
     if edge_error is None:
-        edge_error = compute_edge_error(gt_graph, node_label,
+        edge_error = compute_edge_error(gt_graph, node_label, min_nodes,
                                         merge_label_set=merge_label_set)
 
     E = len(edge_error)
@@ -769,16 +849,16 @@ def summarize(gt_graph, node_label, edge_error=None, merge_label_set=None):
     # what matches results.csv.
     seg_neuron_counts = segment_neuron_node_counts(gt_graph, node_label)
     merged = (merge_label_set if merge_label_set is not None
-              else merge_labels(gt_graph, node_label))
+              else merge_labels(gt_graph, node_label, min_nodes))
     num_merged_edges = 0
     for lab in merged:
         for neuron, c in seg_neuron_counts.get(lab, {}).items():
             num_merged_edges += max(c - 1, 0)
-    # # Merges: a merge label fuses k neurons (with > MERGE_MIN_NODES each) ->
+    # # Merges: a merge label fuses k neurons (with > min_nodes each) ->
     # (k - 1) merge events.
     total_merges = sum(
         max(len([n for n, c in seg_neuron_counts.get(lab, {}).items()
-                 if c > MERGE_MIN_NODES]) - 1, 0)
+                 if c > min_nodes]) - 1, 0)
         for lab in merged
     )
 
