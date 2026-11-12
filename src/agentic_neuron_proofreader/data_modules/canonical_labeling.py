@@ -64,6 +64,19 @@ MERGE_DIST_AWAY_UM = 50.0   # leaf must be this far from any GT node to start a 
 MERGE_APPROACH_UM = 6.0     # walk inward until within this distance of a GT node
 MERGE_PASSTHRU_MIN_CC = 50  # GT same-label component smaller than this = pass-through
 MERGE_DEDUP_UM = 30.0       # merge sites closer than this are duplicates
+MERGE_BRANCH_RADIUS_UM = 40.0  # an accepted site moves to a branching node within this much cable ...
+MERGE_BRANCH_GT_UM = 16.0      # ... that lies within this distance of the GT neuron
+
+# How the merge walk treats the GT neurons. ``MergeCountMetric`` works one GT neuron at a
+# time: a KD-tree of that neuron alone decides where a walk starts and stops, and an
+# accepted site moves to a nearby branching node (``graph_util.search_branching_node``).
+# Until 2026-11 this port used one KD-tree of all GT neurons in a single pass and kept the
+# node where the walk stopped, so a fragment leaf near any other traced neuron started no
+# walk and a walk stopped at whatever tracing it met first; with many traced neurons that
+# loses sites the metric reports. Both are kept: the pooled walk reproduces existing caches.
+WALK_PER_NEURON = "per_neuron"
+WALK_POOLED = "pooled"
+WALKS = (WALK_PER_NEURON, WALK_POOLED)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -414,7 +427,8 @@ def _is_nonmerge_passthru(gt_node, comps, min_cc=MERGE_PASSTHRU_MIN_CC):
     return True
 
 
-def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True, thresholds=None):
+def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True, thresholds=None,
+                          walk=WALK_PER_NEURON):
     """
     Walks fragment skeletons to locate merge sites, porting
     ``MergeCountMetric.search_for_merges`` / ``find_merge_site`` / ``verify_site``
@@ -426,6 +440,11 @@ def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True, t
     pass-through (fewer than ``thresholds.passthru_min_cc`` GT nodes), record a
     merge site. Spatially-redundant sites within ``MERGE_DEDUP_UM`` are collapsed.
 
+    ``walk`` selects how the GT neurons enter (see ``WALKS``): ``"per_neuron"`` (default)
+    follows the metric, one GT neuron at a time with the site moved to a branching node;
+    ``"pooled"`` is the single pass over one KD-tree of all GT neurons that caches written
+    before 2026-11 were labeled with.
+
     Returns
     -------
     (merge_label_set, sites)
@@ -433,6 +452,12 @@ def geometric_merge_sites(fragments_graph, gt_graph, node_label, verbose=True, t
         ``sites`` -- list of dicts (segment_id, gt_neuron, xyz) for inspection.
     """
     passthru_min_cc = resolve_thresholds(thresholds).passthru_min_cc
+    if walk not in WALKS:
+        raise ValueError(f"Unknown merge walk {walk!r}; choose from {WALKS}")
+    if walk == WALK_PER_NEURON:
+        sites = _dedup_sites(_per_neuron_merge_sites(
+            fragments_graph, gt_graph, node_label, passthru_min_cc, verbose))
+        return {s["segment_id"] for s in sites}, sites
     gt_kdtree = gt_graph.kdtree
     label_nodes = _label_to_gt_nodes(gt_graph, node_label)
     labels_on_gt = set(label_nodes)
@@ -725,6 +750,91 @@ def combined_merge_sites(fragments_graph, gt_graph, node_label, geometric_sites,
             existing["junction_evidence"] = site
     return combined, {**metadata, "n_geometric_sites": len(geometric),
                       "n_combined_sites": len(combined)}
+
+
+def _per_neuron_merge_sites(fragments_graph, gt_graph, node_label, passthru_min_cc, verbose=True):
+    """``MergeCountMetric.__call__`` on the cache graphs: for every GT neuron, the fragments
+    whose label appears on it are walked against a KD-tree of that neuron alone (a new visited
+    set per neuron and fragment), and an accepted site moves to a branching node. Returns the
+    sites before de-duplication, in the order (GT neuron, segment id, fragment)."""
+    from scipy.spatial import cKDTree
+
+    label_nodes = _label_to_gt_nodes(gt_graph, node_label)
+    fragments = defaultdict(list)
+    for seg_id, nodes in _fragment_components(fragments_graph, only_labels=set(label_nodes)):
+        fragments[seg_id].append(nodes)
+    frag_xyz = np.asarray(fragments_graph.node_xyz)
+    gt_xyz = np.asarray(gt_graph.node_xyz)
+    gt_neurons = np.asarray(gt_graph.node_component_id)
+    iterator = [int(neuron) for neuron in np.unique(gt_neurons)]
+    if verbose:
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(iterator, desc="Merge walk (per GT neuron)")
+        except ImportError:
+            pass
+
+    raw_sites = list()
+    for neuron in iterator:
+        members = np.flatnonzero(gt_neurons == neuron)
+        own_labels = defaultdict(list)
+        for gt_node in members:
+            label = int(node_label[gt_node])
+            if label != UNLABELED:
+                own_labels[label].append(int(gt_node))
+        kdtree = cKDTree(gt_xyz[members])
+        for seg_id in sorted(own_labels):
+            if seg_id not in fragments:
+                continue
+            gt_comps = _gt_label_components(gt_graph, seg_id, own_labels)
+            for nodes in fragments[seg_id]:
+                distance, index = kdtree.query(frag_xyz[nodes])
+                near = dict(zip(nodes, zip(distance.tolist(), members[index].tolist())))
+                visited = set()
+                for leaf in nodes:
+                    if fragments_graph.degree[leaf] != 1 or leaf in visited:
+                        continue
+                    visited.add(leaf)
+                    if near[leaf][0] <= MERGE_DIST_AWAY_UM:
+                        continue
+                    queue = deque([leaf])
+                    while queue:
+                        i = queue.pop()
+                        dist_i, gt_node = near[i]
+                        if dist_i < MERGE_APPROACH_UM:
+                            if not _is_nonmerge_passthru(gt_node, gt_comps, passthru_min_cc):
+                                xyz = frag_xyz[_branching_node(fragments_graph, frag_xyz, near, i)]
+                                raw_sites.append({
+                                    "segment_id": seg_id,
+                                    "gt_neuron": gt_graph.node_segment_id(int(gt_node)),
+                                    "xyz": (float(xyz[0]), float(xyz[1]), float(xyz[2])),
+                                })
+                            break
+                        for j in fragments_graph.neighbors(i):
+                            if j in near and j not in visited:
+                                queue.append(j)
+                                visited.add(j)
+    return raw_sites
+
+
+def _branching_node(fragments_graph, frag_xyz, near, root):
+    """``graph_util.search_branching_node``: the first node of degree > 2, breadth first within
+    ``MERGE_BRANCH_RADIUS_UM`` of cable from ``root``, that lies within ``MERGE_BRANCH_GT_UM`` of
+    the GT neuron (``near`` holds each fragment node's distance to it); ``root`` if there is none."""
+    queue = deque([(root, 0.0)])
+    visited = {root}
+    while queue:
+        i, d_i = queue.popleft()
+        if fragments_graph.degree[i] > 2 and near[i][0] < MERGE_BRANCH_GT_UM:
+            return i
+        for j in fragments_graph.neighbors(i):
+            if j in visited or j not in near:
+                continue
+            d_j = d_i + float(np.linalg.norm(frag_xyz[j] - frag_xyz[i]))
+            if d_j < MERGE_BRANCH_RADIUS_UM:
+                queue.append((j, d_j))
+                visited.add(j)
+    return root
 
 
 def _walk_to_merge_site(fragments_graph, gt_graph, node_label, gt_kdtree,

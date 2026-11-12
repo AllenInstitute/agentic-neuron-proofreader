@@ -67,7 +67,7 @@ class BrainDataset(Dataset):
     # --- Canonical labeling ---
     def label_gt_from_segmentation(self, segmentation_path=None,
                                    geometric_merges=True, verbose=True,
-                                   thresholds=None):
+                                   thresholds=None, walk=canonical_labeling.WALK_PER_NEURON):
         """
         Reads the dense predicted segmentation at every GT node's voxel and
         attaches the canonical per-node label and per-edge error class to
@@ -127,11 +127,11 @@ class BrainDataset(Dataset):
         self.segmentation_path = seg_path
         self.gt_graph.node_label = node_label
         self.refresh_merge_labels(geometric_merges=geometric_merges, verbose=verbose,
-                                  thresholds=thresholds)
+                                  thresholds=thresholds, walk=walk)
         return node_label
 
     def refresh_merge_labels(self, geometric_merges=True, reuse_geometric_sites=False, verbose=True,
-                             thresholds=None):
+                             thresholds=None, walk=canonical_labeling.WALK_PER_NEURON):
         """Rebuild merge truth from stored GT node labels, with no volume reads.
 
         Both criteria feed one merge_labels set and one merge_sites list. When
@@ -143,6 +143,11 @@ class BrainDataset(Dataset):
         node-count thresholds of every rule; None means the module constants.
         The thresholds used are recorded on ``gt_graph.label_policy`` and in
         ``gt_graph.merge_site_metadata``.
+
+        ``walk`` (``canonical_labeling.WALKS``) is how the geometric walk treats the GT
+        neurons: ``"per_neuron"`` as in the metric (default), or ``"pooled"``, the single
+        pass that caches written before 2026-11 were labeled with. It is recorded on
+        ``gt_graph.label_policy`` (``"reused"`` when the stored sites are kept).
         """
         if self.gt_graph is None or getattr(self.gt_graph, "node_label", None) is None:
             raise ValueError("Canonical GT node labels are required")
@@ -163,7 +168,7 @@ class BrainDataset(Dataset):
             self.gt_graph.set_kdtree()
             geometric_labels, sites = canonical_labeling.geometric_merge_sites(
                 self.fragments_graph, self.gt_graph, node_label, verbose=verbose,
-                thresholds=thresholds)
+                thresholds=thresholds, walk=walk)
             merge_set.update(geometric_labels)
         metadata = None
         if self.fragments_graph is not None:
@@ -179,6 +184,7 @@ class BrainDataset(Dataset):
         self.gt_graph.label_policy = {
             **thresholds.as_record(),
             "reused_geometric_sites": bool(reuse_geometric_sites),
+            "walk": "reused" if reuse_geometric_sites else walk,
             "written": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         self.gt_graph.junction_gt_audit = None
